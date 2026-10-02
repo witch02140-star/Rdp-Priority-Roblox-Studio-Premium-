@@ -1,0 +1,677 @@
+name: RDP Roblox Studio Priority
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+
+      # ============================================================
+      # 1. ENABLE RDP
+      # ============================================================
+      - name: Configure RDP
+        shell: powershell
+        run: |
+          Write-Host "=== CONFIGURING RDP ==="
+
+          $tsPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
+          $rdpPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+
+          Set-ItemProperty `
+            -Path $tsPath `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
+
+          # Compatibility mode
+          Set-ItemProperty `
+            -Path $rdpPath `
+            -Name "UserAuthentication" `
+            -Value 0 `
+            -Force
+
+          Set-ItemProperty `
+            -Path $rdpPath `
+            -Name "SecurityLayer" `
+            -Value 1 `
+            -Force
+
+          # --------------------------------------------------------
+          # RDP SERVER POLICIES
+          # --------------------------------------------------------
+          $policyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+
+          New-Item `
+            -Path $policyPath `
+            -Force | Out-Null
+
+          # Use UDP + TCP.
+          # 2 = Use either UDP or TCP
+          New-ItemProperty `
+            -Path $policyPath `
+            -Name "SelectTransport" `
+            -PropertyType DWord `
+            -Value 2 `
+            -Force | Out-Null
+
+          # Automatic reconnect
+          New-ItemProperty `
+            -Path $policyPath `
+            -Name "fDisableAutoReconnect" `
+            -PropertyType DWord `
+            -Value 0 `
+            -Force | Out-Null
+
+          # Prefer hardware H.264 if available.
+          # If unavailable Windows falls back to software.
+          New-ItemProperty `
+            -Path $policyPath `
+            -Name "AVCHardwareEncodePreferred" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          # Do not force AVC444.
+          # Lower bandwidth usage is more important here.
+          New-ItemProperty `
+            -Path $policyPath `
+            -Name "AVC444ModePreferred" `
+            -PropertyType DWord `
+            -Value 0 `
+            -Force | Out-Null
+
+          # RDP compression:
+          # 3 = optimized to use less network bandwidth
+          New-ItemProperty `
+            -Path $policyPath `
+            -Name "MaxCompressionLevel" `
+            -PropertyType DWord `
+            -Value 3 `
+            -Force | Out-Null
+
+          # --------------------------------------------------------
+          # FIREWALL TCP + UDP 3389
+          # --------------------------------------------------------
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+
+          netsh advfirewall firewall add rule `
+            name="RDP-Tailscale" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=3389
+
+          netsh advfirewall firewall add rule `
+            name="RDP-Tailscale" `
+            dir=in `
+            action=allow `
+            protocol=UDP `
+            localport=3389
+
+          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+
+          Write-Host "RDP configured."
+
+      # ============================================================
+      # 2. CREATE RDP USER
+      # ============================================================
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          Write-Host "=== CREATING RDP USER ==="
+
+          $userName = "Skyro"
+
+          # Generate 16-character password
+          $upper   = [char[]](65..90)
+          $lower   = [char[]](97..122)
+          $number  = [char[]](48..57)
+          $special = [char[]](33..47)
+
+          $raw = @()
+          $raw += $upper   | Get-Random -Count 4
+          $raw += $lower   | Get-Random -Count 4
+          $raw += $number  | Get-Random -Count 4
+          $raw += $special | Get-Random -Count 4
+
+          $password = -join ($raw | Sort-Object { Get-Random })
+
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          # Create user only when needed
+          $existing = Get-LocalUser `
+            -Name $userName `
+            -ErrorAction SilentlyContinue
+
+          if (-not $existing) {
+            New-LocalUser `
+              -Name $userName `
+              -Password $securePassword `
+              -AccountNeverExpires `
+              -PasswordNeverExpires:$true | Out-Null
+          }
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $userName `
+            -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $userName `
+            -ErrorAction SilentlyContinue
+
+          "RDP_USER=$userName" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          Write-Host "RDP USER: $userName"
+          Write-Host "RDP PASSWORD: $password"
+
+      # ============================================================
+      # 3. WINDOWS PERFORMANCE MODE
+      # ============================================================
+      - name: Windows Performance Mode
+        shell: powershell
+        run: |
+          Write-Host "=== PERFORMANCE MODE ==="
+
+          # High performance power plan
+          powercfg /setactive SCHEME_MAX 2>$null
+
+          # Never turn off display while runner is active
+          powercfg /change -monitor-timeout-ac 0 2>$null
+          powercfg /change -standby-timeout-ac 0 2>$null
+          powercfg /change -hibernate-timeout-ac 0 2>$null
+
+          # Machine visual settings
+          $visualPath =
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
+
+          New-Item `
+            -Path $visualPath `
+            -Force | Out-Null
+
+          Set-ItemProperty `
+            -Path $visualPath `
+            -Name "VisualFXSetting" `
+            -Value 2 `
+            -Force
+
+          # Disable transparency
+          $personalize =
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+
+          New-Item `
+            -Path $personalize `
+            -Force | Out-Null
+
+          New-ItemProperty `
+            -Path $personalize `
+            -Name "EnableTransparency" `
+            -PropertyType DWord `
+            -Value 0 `
+            -Force | Out-Null
+
+          # Disable Game DVR / background capture
+          New-Item `
+            -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" `
+            -Force | Out-Null
+
+          New-ItemProperty `
+            -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" `
+            -Name "AllowGameDVR" `
+            -PropertyType DWord `
+            -Value 0 `
+            -Force | Out-Null
+
+          # Stop services that aren't needed for Studio work.
+          $services = @(
+            "SysMain",
+            "WSearch",
+            "DiagTrack",
+            "MapsBroker",
+            "Fax",
+            "XblGameSave",
+            "XboxNetApiSvc"
+          )
+
+          foreach ($service in $services) {
+            Stop-Service `
+              -Name $service `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+            Set-Service `
+              -Name $service `
+              -StartupType Disabled `
+              -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Performance mode applied."
+
+      # ============================================================
+      # 4. NETWORK QOS FOR ROBLOX STUDIO
+      # ============================================================
+      - name: Prioritize Roblox Studio Network
+        shell: powershell
+        run: |
+          Write-Host "=== ROBLOX STUDIO NETWORK PRIORITY ==="
+
+          # Remove old policies from this runner
+          Remove-NetQosPolicy `
+            -Name "RobloxStudioPriority" `
+            -Confirm:$false `
+            -ErrorAction SilentlyContinue
+
+          Remove-NetQosPolicy `
+            -Name "RDPInteractivePriority" `
+            -Confirm:$false `
+            -ErrorAction SilentlyContinue
+
+          # --------------------------------------------------------
+          # ROBLOX STUDIO
+          # DSCP 46 = high-priority network marking
+          # MinBandwidthWeight = 80
+          # --------------------------------------------------------
+          try {
+            New-NetQosPolicy `
+              -Name "RobloxStudioPriority" `
+              -AppPathNameMatchCondition "RobloxStudioBeta.exe" `
+              -IPProtocolMatchCondition Both `
+              -DSCPAction 46 `
+              -MinBandwidthWeightAction 80 `
+              -PolicyStore ActiveStore `
+              -ErrorAction Stop
+
+            Write-Host "Roblox Studio QoS enabled."
+          }
+          catch {
+            Write-Warning "Roblox Studio QoS could not be created: $($_.Exception.Message)"
+          }
+
+          # --------------------------------------------------------
+          # RDP INTERACTIVE TRAFFIC
+          # Keeps the remote display responsive.
+          # --------------------------------------------------------
+          try {
+            New-NetQosPolicy `
+              -Name "RDPInteractivePriority" `
+              -IPPortMatchCondition 3389 `
+              -IPProtocolMatchCondition Both `
+              -DSCPAction 34 `
+              -PolicyStore ActiveStore `
+              -ErrorAction Stop
+
+            Write-Host "RDP QoS enabled."
+          }
+          catch {
+            Write-Warning "RDP QoS could not be created: $($_.Exception.Message)"
+          }
+
+          Write-Host ""
+          Write-Host "=== CURRENT QOS ==="
+
+          Get-NetQosPolicy `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Name -in @(
+                "RobloxStudioPriority",
+                "RDPInteractivePriority"
+              )
+            } |
+            Format-Table -AutoSize
+
+      # ============================================================
+      # 5. CREATE ROBLOX STUDIO BOOST SCRIPT
+      # ============================================================
+      - name: Create Roblox Studio Boost
+        shell: powershell
+        run: |
+          Write-Host "=== CREATING STUDIO BOOST ==="
+
+          $boostPath = "C:\ProgramData\RobloxStudioBoost.ps1"
+
+          $script = @'
+# ============================================================
+# ROBLOX STUDIO BOOST
+# Runs in the Skyro interactive session
+# ============================================================
+
+$ErrorActionPreference = "SilentlyContinue"
+
+# ------------------------------------------------------------
+# USER VISUAL SETTINGS
+# ------------------------------------------------------------
+$visual = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
+
+New-Item `
+  -Path $visual `
+  -Force | Out-Null
+
+Set-ItemProperty `
+  -Path $visual `
+  -Name "VisualFXSetting" `
+  -Value 2 `
+  -Force
+
+$personalize =
+  "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+
+New-Item `
+  -Path $personalize `
+  -Force | Out-Null
+
+Set-ItemProperty `
+  -Path $personalize `
+  -Name "EnableTransparency" `
+  -Value 0 `
+  -Force
+
+# Disable animations
+$windowMetrics =
+  "HKCU:\Control Panel\Desktop\WindowMetrics"
+
+New-Item `
+  -Path $windowMetrics `
+  -Force | Out-Null
+
+Set-ItemProperty `
+  -Path $windowMetrics `
+  -Name "MinAnimate" `
+  -Value "0" `
+  -Force
+
+# ------------------------------------------------------------
+# CURRENT USER BACKGROUND APPS
+# ------------------------------------------------------------
+$backgroundApps = @(
+  "msedge",
+  "MicrosoftEdge",
+  "OneDrive",
+  "Teams",
+  "Widgets",
+  "SearchApp",
+  "SearchHost"
+)
+
+foreach ($name in $backgroundApps) {
+  Get-Process `
+    -Name $name `
+    -ErrorAction SilentlyContinue |
+    Stop-Process `
+      -Force `
+      -ErrorAction SilentlyContinue
+}
+
+# ------------------------------------------------------------
+# LOCATE ROBLOX STUDIO
+# ------------------------------------------------------------
+function Find-RobloxStudio {
+  $base = "$env:LOCALAPPDATA\Roblox\Versions"
+
+  if (-not (Test-Path $base)) {
+    return $null
+  }
+
+  return Get-ChildItem `
+    -Path $base `
+    -Recurse `
+    -Filter "RobloxStudioBeta.exe" `
+    -File `
+    -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+}
+
+Write-Host "Looking for Roblox Studio..."
+
+$studio = $null
+
+for ($i = 0; $i -lt 30; $i++) {
+  $studio = Find-RobloxStudio
+
+  if ($studio) {
+    break
+  }
+
+  Start-Sleep -Seconds 2
+}
+
+if (-not $studio) {
+  Write-Host ""
+  Write-Host "Roblox Studio was not found."
+  Write-Host "Install Roblox Studio in the Skyro account first."
+  exit 0
+}
+
+Write-Host "Studio found:"
+Write-Host $studio.FullName
+
+# ------------------------------------------------------------
+# START STUDIO
+# ------------------------------------------------------------
+$running = Get-Process `
+  -Name "RobloxStudioBeta" `
+  -ErrorAction SilentlyContinue
+
+if (-not $running) {
+  Write-Host "Starting Roblox Studio..."
+
+  Start-Process `
+    -FilePath $studio.FullName `
+    -WorkingDirectory $studio.DirectoryName
+}
+
+# ------------------------------------------------------------
+# CONTINUOUS PERFORMANCE BOOST
+# ------------------------------------------------------------
+while ($true) {
+
+  $studioProcesses = Get-Process `
+    -Name "RobloxStudioBeta" `
+    -ErrorAction SilentlyContinue
+
+  foreach ($process in $studioProcesses) {
+
+    # High priority for CPU scheduling
+    try {
+      $process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High
+    }
+    catch {}
+
+    # Prevent Windows background power throttling
+    try {
+      $process.ProcessorAffinity = $process.ProcessorAffinity
+    }
+    catch {}
+  }
+
+  Start-Sleep -Seconds 5
+}
+'@
+
+          Set-Content `
+            -Path $boostPath `
+            -Value $script `
+            -Encoding UTF8 `
+            -Force
+
+          Write-Host "Boost script created."
+
+      # ============================================================
+      # 6. RUN BOOST AUTOMATICALLY WHEN SKYRO LOGS IN
+      # ============================================================
+      - name: Auto Boost Roblox Studio On Login
+        shell: powershell
+        run: |
+          Write-Host "=== REGISTERING STUDIO BOOST TASK ==="
+
+          $boostPath = "C:\ProgramData\RobloxStudioBoost.ps1"
+
+          $action = New-ScheduledTaskAction `
+            -Execute "powershell.exe" `
+            -Argument "-NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$boostPath`""
+
+          $trigger = New-ScheduledTaskTrigger `
+            -AtLogOn
+
+          $principal = New-ScheduledTaskPrincipal `
+            -UserId "Skyro" `
+            -LogonType Interactive `
+            -RunLevel Highest
+
+          Register-ScheduledTask `
+            -TaskName "RobloxStudioBoost" `
+            -Action $action `
+            -Trigger $trigger `
+            -Principal $principal `
+            -Force
+
+          Write-Host "Task registered."
+
+      # ============================================================
+      # 7. CHECK TAILSCALE
+      # ============================================================
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          Write-Host "=== INSTALLING TAILSCALE ==="
+
+          $tsUrl =
+            "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+
+          $installer =
+            "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri $tsUrl `
+            -OutFile $installer
+
+          Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait
+
+          Remove-Item `
+            -Path $installer `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Tailscale installed."
+
+      # ============================================================
+      # 8. CONNECT TAILSCALE
+      # ============================================================
+      - name: Connect Tailscale
+        shell: powershell
+        run: |
+          Write-Host "=== CONNECTING TAILSCALE ==="
+
+          $ts =
+            "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
+            Write-Error "Tailscale executable not found."
+            exit 1
+          }
+
+          & $ts up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-studio-$env:GITHUB_RUN_ID
+
+          $tsIP = $null
+
+          for ($i = 0; $i -lt 20; $i++) {
+
+            $tsIP =
+              (& $ts ip -4 2>$null | Select-Object -First 1).Trim()
+
+            if ($tsIP) {
+              break
+            }
+
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $tsIP) {
+            Write-Error "Tailscale IPv4 address was not assigned."
+            exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale IP: $tsIP"
+
+      # ============================================================
+      # 9. VERIFY RDP
+      # ============================================================
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          Write-Host "=== TESTING RDP ==="
+
+          $result = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
+            -InformationLevel Quiet
+
+          if (-not $result) {
+            Write-Warning "RDP TCP test failed."
+            Write-Warning "UDP may still work when connecting from your client."
+          }
+          else {
+            Write-Host "RDP TCP connection OK."
+          }
+
+      # ============================================================
+      # 10. FINAL STATUS
+      # ============================================================
+      - name: Maintain Connection
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "       ROBLOX STUDIO PRIORITY RDP"
+          Write-Host "=============================================="
+          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host "Username     : $env:RDP_USER"
+          Write-Host "Password     : $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "CPU/RAM      : RobloxStudioBeta = HIGH"
+          Write-Host "NETWORK      : Roblox Studio QoS = ENABLED"
+          Write-Host "RDP          : UDP + TCP"
+          Write-Host "COMPRESSION  : LOW-BANDWIDTH"
+          Write-Host "=============================================="
+          Write-Host ""
+
+          while ($true) {
+
+            $studio = Get-Process `
+              -Name "RobloxStudioBeta" `
+              -ErrorAction SilentlyContinue
+
+            if ($studio) {
+
+              foreach ($p in $studio) {
+                try {
+                  $p.PriorityClass =
+                    [System.Diagnostics.ProcessPriorityClass]::High
+                }
+                catch {}
+              }
+
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Roblox Studio priority active."
+            }
+            else {
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Roblox Studio not running."
+            }
+
+            Start-Sleep -Seconds 15
+          }
